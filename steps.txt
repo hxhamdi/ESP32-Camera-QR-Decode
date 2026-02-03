@@ -1,0 +1,321 @@
+void app_main(void)
+{
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+
+    if (cause == ESP_SLEEP_WAKEUP_EXT0) {
+        // We were explicitly woken to work
+
+        uart_init();
+
+        if (esp_camera_init(&camera_config) == ESP_OK) {
+            capture_and_decode_qr();
+            esp_camera_deinit();
+        }
+
+        // Give UART time to flush
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    // Prepare to sleep again
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_13, 1);
+
+    // Important: GPIO13 must be LOW before sleeping
+    gpio_hold_en(GPIO_NUM_13);
+
+    esp_deep_sleep_start();
+}
+
+static camera_config_t camera_config = {
+    .pin_pwdn  = 32,
+    .pin_reset = -1,
+    .pin_xclk = 0,
+    .pin_sscb_sda = 26,
+    .pin_sscb_scl = 27,
+
+    .pin_d7 = 35,
+    .pin_d6 = 34,
+    .pin_d5 = 39,
+    .pin_d4 = 36,
+    .pin_d3 = 21,
+    .pin_d2 = 19,
+    .pin_d1 = 18,
+    .pin_d0 = 5,
+    .pin_vsync = 25,
+    .pin_href = 23,
+    .pin_pclk = 22,
+
+    .xclk_freq_hz = 20000000,
+    .ledc_timer   = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+
+    .pixel_format = PIXFORMAT_GRAYSCALE,   // NON-NEGOTIABLE
+    .frame_size   = FRAMESIZE_QVGA,
+    .fb_count     = 1
+};
+
+static void uart_init(void)
+{
+    uart_config_t cfg = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+
+    uart_driver_install(UART_NUM_1, 1024, 0, 0, NULL, 0);
+    uart_param_config(UART_NUM_1, &cfg);
+    uart_set_pin(UART_NUM_1, 4, 15, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
+static void capture_and_decode_qr(void)
+{
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) return;
+
+    struct quirc *qr = quirc_new();
+    if (!qr) goto cleanup;
+
+    if (quirc_resize(qr, fb->width, fb->height) < 0)
+        goto qr_cleanup;
+
+    uint8_t *image = quirc_begin(qr, NULL, NULL);
+    memcpy(image, fb->buf, fb->width * fb->height);
+    quirc_end(qr);
+
+    if (quirc_count(qr) > 0) {
+        struct quirc_code code;
+        struct quirc_data data;
+
+        quirc_extract(qr, 0, &code);
+        if (quirc_decode(&code, &data) == 0) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "QR:%s\r\n", data.payload);
+            uart_write_bytes(UART_NUM_1, msg, strlen(msg));
+        }
+    }
+
+qr_cleanup:
+    quirc_destroy(qr);
+cleanup:
+    esp_camera_fb_return(fb);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Since I'm using both ESP32 and ESP-CAM, how to capture the image using the latter and sending it to the former using UART so it can process the qr
+
+
+
+Good questions. This is where the system stops being a “demo” and becomes a real embedded system. I’ll be direct and precise, and I’ll correct assumptions where needed.
+1️⃣ Reality check (important)
+You cannot realistically:
+Capture an image on ESP32-CAM
+Send the raw image over UART to ESP32
+Decode QR on the ESP32
+Why?
+ESP32-CAM JPEG = 40–150 KB
+UART @115200 ≈ 11 KB/s
+You’d block the system for seconds
+ESP32 RAM fragmentation risk
+Totally unnecessary complexity
+✅ Correct architecture (industry-grade)
+QR decoding must happen on the ESP32-CAM, not the main ESP32.
+The ESP32-CAM:
+Captures image
+Decodes QR (quirc)
+Sends only the decoded string to ESP32 over UART
+ESP32:
+Validates QR
+Sends data to Firebase via GSM (SIM800)
+This is the only sane design.
+2️⃣ Data Flow (Final Architecture)
+Copy code
+
+ESP32-CAM
+ ├─ Capture image
+ ├─ Decode QR (quirc)
+ └─ UART → QR_STRING
+
+ESP32
+ ├─ Receive QR string
+ ├─ Fetch parking lot data (HTTP GET)
+ ├─ Validate available spots
+ ├─ Update Firestore (HTTP POST)
+ └─ Log entry
+3️⃣ UART Protocol Between ESP32-CAM ↔ ESP32
+UART Message Format (simple & robust)
+Copy code
+
+QR:<user_id>|<parking_lot_id>\n
+Example:
+Copy code
+
+QR:u123|lotA\n
+4️⃣ ESP32-CAM Side (QR Capture + Decode)
+ESP-IDF Component Required
+Add to components/:
+Copy code
+
+components/
+ └── quirc/
+(Official Espressif component: espressif/quirc)
+ESP32-CAM QR Capture Code
+camera_qr.c (ESP32-CAM)
+Copy code
+C
+#include "esp_camera.h"
+#include "quirc.h"
+#include "driver/uart.h"
+
+static struct quirc *qr;
+
+void qr_init()
+{
+    qr = quirc_new();
+}
+
+void capture_and_decode_qr()
+{
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) return;
+
+    quirc_resize(qr, fb->width, fb->height);
+    uint8_t *image = quirc_begin(qr, NULL, NULL);
+
+    memcpy(image, fb->buf, fb->len);
+    quirc_end(qr);
+
+    int count = quirc_count(qr);
+    if (count > 0) {
+        struct quirc_code code;
+        struct quirc_data data;
+
+        quirc_extract(qr, 0, &code);
+        if (!quirc_decode(&code, &data)) {
+            uart_write_bytes(UART_NUM_1,
+                (const char *)data.payload,
+                data.payload_len);
+            uart_write_bytes(UART_NUM_1, "\n", 1);
+        }
+    }
+
+    esp_camera_fb_return(fb);
+}
+ESP32-CAM UART TX Config
+Copy code
+C
+uart_config_t uart_cfg = {
+    .baud_rate = 115200,
+    .data_bits = UART_DATA_8_BITS,
+    .parity = UART_PARITY_DISABLE,
+    .stop_bits = UART_STOP_BITS_1,
+};
+
+uart_param_config(UART_NUM_1, &uart_cfg);
+uart_set_pin(UART_NUM_1, GPIO_NUM_14, GPIO_NUM_15, -1, -1);
+uart_driver_install(UART_NUM_1, 2048, 0, 0, NULL, 0);
+5️⃣ ESP32 Side: Receive QR via UART
+Copy code
+C
+static void qr_uart_task(void *arg)
+{
+    char buf[128];
+
+    while (1) {
+        int len = uart_read_bytes(UART_NUM_1, buf, sizeof(buf)-1, pdMS_TO_TICKS(500));
+        if (len > 0) {
+            buf[len] = 0;
+
+            if (strncmp(buf, "QR:", 3) == 0) {
+                handle_qr_data(buf + 3);
+            }
+        }
+    }
+}
+6️⃣ Function: Retrieve Parking Lot Data (HTTP GET)
+ESP32 (SIM800 → backend)
+Copy code
+C
+bool get_parking_lot_data(const char *lot_id, int *available_spots)
+{
+    char url[128];
+    sprintf(url, "/parking_lots/%s", lot_id);
+
+    sim800_http_get(url);
+
+    // parse JSON response
+    // example: { "available_spots": 12 }
+    *available_spots = parse_json_int("available_spots");
+
+    return true;
+}
+7️⃣ Function: Update Firebase (HTTP POST)
+ESP32 must not talk to Firestore directly
+Always go through your backend API
+Copy code
+C
+void update_parking_log(const char *user_id, const char *lot_id)
+{
+    char payload[256];
+
+    sprintf(payload,
+        "{ \"user_id\":\"%s\", \"parking_lot_id\":\"%s\", \"status\":\"confirmed\" }",
+        user_id, lot_id
+    );
+
+    sim800_http_post("/parking_logs", payload);
+}
+8️⃣ QR Handling Logic (ESP32)
+Copy code
+C
+void handle_qr_data(char *qr)
+{
+    char user_id[32], lot_id[32];
+
+    sscanf(qr, "%31[^|]|%31s", user_id, lot_id);
+
+    int spots = 0;
+    if (!get_parking_lot_data(lot_id, &spots)) return;
+
+    if (spots > 0) {
+        update_parking_log(user_id, lot_id);
+    }
+}
+9️⃣ What You Just Achieved (No BS)
+✔ No heavy image transfer
+✔ QR decoding where it belongs
+✔ GSM used efficiently
+✔ Firebase writes controlled
+✔ Scalable to many gates
+10️⃣ Common Mistakes You Avoided
+❌ Sending JPEG over UART
+❌ Decoding QR on SIM800 (impossible)
+❌ Firestore direct access from ESP32
+❌ Blocking GSM calls
+Next Logical Enhancements
+QR replay protection (timestamp + nonce)
+Local cache if GSM down
+Gate relay control
+ESP32-CAM deep sleep until trigger
+If you want, next I can:
+Write the ESP32-CAM full project
+Add secure token QR
+Optimize GSM power handling
+Add gate motor control logic
+Just say which.
