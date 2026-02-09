@@ -80,82 +80,70 @@ static void uart_init(void)
 
 static void capture_and_decode_qr(void)
 {
-    if (!qr) {
-        ESP_LOGE(TAG, "Failed to allocate memory");
-        vTaskDelay(pdMS_TO_TICKS(1000000));
-    } else {
-        ESP_LOGI(TAG, "Allocated memory");
-    }
-
-    if (quirc_resize(qr, 320, 240) < 0) {
-        ESP_LOGE(TAG, "Failed to allocate video memory");
-        vTaskDelay(pdMS_TO_TICKS(1000000));
-    } else {
-        ESP_LOGI(TAG, "Allocated video memory");
-    }
-
-    ESP_LOGI(TAG, "0");
-
-    uint8_t *image;
     int w, h;
 
-    ESP_LOGI(TAG, "Before quirc_begin");
-    image = quirc_begin(qr, &w, &h);
-    if (!image) {
-        ESP_LOGE(TAG, "Failed to begin quirc");
-        vTaskDelay(pdMS_TO_TICKS(1000000));
-        return;
-    }
-    ESP_LOGI(TAG, "After quirc_begin");
-
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-        ESP_LOGE(TAG, "Camera Capture Failed");
+    qr = quirc_new();
+    if (!qr) {
+        ESP_LOGE(TAG, "Failed to create quirc");
+        vTaskDelete(NULL);
         return;
     }
 
-    size_t expected_len = w * h;
+    quirc_resize(qr, 320, 240);
 
-    ESP_LOGI(TAG, "fb->len = %d, expected = %d", fb->len, expected_len);
-
-    if (fb->len != expected_len) {
-        ESP_LOGE(TAG, "Framebuffer size mismatch!");
-        esp_camera_fb_return(fb);
-        quirc_destroy(qr);
-        return;
-    }
-
-    memcpy(image, fb->buf, fb->len);
-
-    if (fb->width != w || fb->height != h) {
-        ESP_LOGE(TAG, "Resolution mismatch");
-    } else {
-        ESP_LOGI(TAG, "Resolution matches");
-    }
-    ESP_LOGI(TAG, "Copied image data to quirc buffer");
-
-    quirc_end(qr);
-    ESP_LOGI(TAG, "Finished quirc_end with %d bytes", fb->len);
-    ESP_LOGI(TAG, "quirc_count = %d", quirc_count(qr));
-
-    int count = quirc_count(qr);
-    for (int i = 0; i < count; i++) {
-        quirc_decode_error_t err;
-
-        quirc_extract(qr, i, &code);
-        ESP_LOGI(TAG, "Extracted code %d, now decoding", i);
-        err = quirc_decode(&code, &data);
-
-        if (err == QUIRC_SUCCESS) {
-            ESP_LOGI(TAG, "QR: %s", data.payload);
-        } else {
-            ESP_LOGW(TAG, "QR decode failed: %d", err);
+    while (true) {
+        // Capture frame
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            ESP_LOGE(TAG, "Camera capture failed");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
         }
+
+        // Get pointer into quirc buffer
+        uint8_t *buf = quirc_begin(qr, &w, &h);
+        if (!buf) {
+            ESP_LOGE(TAG, "quirc_begin failed");
+            esp_camera_fb_return(fb);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        // Copy grayscale data (fb->len == w*h when PIXFORMAT_GRAYSCALE)
+        memcpy(buf, fb->buf, w*h);
+
+        quirc_end(qr);
+
+        int count = quirc_count(qr);
+        ESP_LOGI(TAG, "QR count: %d", count);
+
+        for (int i = 0; i < count; i++) {
+            struct quirc_code code;
+            struct quirc_data data;
+            quirc_extract(qr, i, &code);
+
+            quirc_decode_error_t err = quirc_decode(&code, &data);
+            if (err == QUIRC_SUCCESS) {
+                // Null-terminate and print payload
+                char payload[256];
+                int len = data.payload_len < sizeof(payload)-1 ? data.payload_len
+                                                                 : sizeof(payload)-1;
+                memcpy(payload, data.payload, len);
+                payload[len] = 0;
+
+                ESP_LOGI(TAG, "Decoded: %s", payload);
+            } else {
+                ESP_LOGW(TAG, "Decode error: %d", err);
+            }
+        }
+
+        esp_camera_fb_return(fb);
+
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
-    ESP_LOGI(TAG, "Done processing QR code");
-    esp_camera_fb_return(fb);
-    vTaskDelay(pdMS_TO_TICKS(100));
+
     quirc_destroy(qr);
+    vTaskDelete(NULL);
 }
 
 static void cam_task(void *arg)
@@ -167,11 +155,31 @@ static void cam_task(void *arg)
 
     if (esp_camera_init(&camera_config) == ESP_OK) {
         sensor_t *s = esp_camera_sensor_get();
-        s->set_gain_ctrl(s, 0);     // manual gain
-        s->set_exposure_ctrl(s, 0);// manual exposure
-        s->set_awb_gain(s, 0);     // disable auto white balance
+        if (!s) {
+            ESP_LOGE(TAG, "Failed to get camera sensor");
+            return;
+        }
+
+        /* Orientation — start with both */
+        s->set_hmirror(s, 1);
+        s->set_vflip(s, 1);
+
+        /* QR-friendly tuning */
+        s->set_contrast(s, 2);      // very important
+        s->set_brightness(s, 1);
+        s->set_saturation(s, -2);   // grayscale boost
+
+        /* Disable things that hurt QR */
         s->set_whitebal(s, 0);
-        s->set_lenc(s, 0);         // lens correction off
+        s->set_awb_gain(s, 0);
+        s->set_gain_ctrl(s, 0);
+        s->set_exposure_ctrl(s, 0);
+        s->set_lenc(s, 0);
+
+        /* Manual exposure/gain sweet spot */
+        s->set_gainceiling(s, GAINCEILING_16X);
+        s->set_agc_gain(s, 5);
+        s->set_aec_value(s, 600);
         qr = quirc_new();
         assert(qr);
         vTaskDelay(pdMS_TO_TICKS(200));
