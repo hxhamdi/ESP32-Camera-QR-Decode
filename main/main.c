@@ -26,7 +26,7 @@
 #define VSYNC_GPIO_NUM    25
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
-
+#define LED_GPIO_PIN 4 // GPIO pin for LED flash (if available)
 #define TAG "QR_TASK"
 
 static camera_config_t camera_config = {
@@ -153,16 +153,18 @@ static void cam_task(void *arg)
          uxTaskGetStackHighWaterMark(NULL));
     uart_init();
 
+    // Disable LED pin
+    gpio_set_direction(LED_GPIO_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO_PIN, 0);  // Set to 0 to turn off the LED    
     if (esp_camera_init(&camera_config) == ESP_OK) {
         sensor_t *s = esp_camera_sensor_get();
         if (!s) {
             ESP_LOGE(TAG, "Failed to get camera sensor");
             return;
         }
-
-        /* Orientation — start with both */
+        s->set_vflip(s, 1);        // Example of other sensor tuning
         s->set_hmirror(s, 1);
-        s->set_vflip(s, 1);
+        s->set_lenc(s, 0);
 
         /* QR-friendly tuning */
         s->set_contrast(s, 2);      // very important
