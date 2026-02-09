@@ -138,11 +138,12 @@ static void capture_and_decode_qr(void)
     ESP_LOGI(TAG, "Finished quirc_end with %d bytes", fb->len);
     ESP_LOGI(TAG, "quirc_count = %d", quirc_count(qr));
 
-    if (quirc_count(qr) > 0) {
+    int count = quirc_count(qr);
+    for (int i = 0; i < count; i++) {
         quirc_decode_error_t err;
 
-        quirc_extract(qr, 0, &code);
-        ESP_LOGI(TAG, "Extracted code, now decoding");
+        quirc_extract(qr, i, &code);
+        ESP_LOGI(TAG, "Extracted code %d, now decoding", i);
         err = quirc_decode(&code, &data);
 
         if (err == QUIRC_SUCCESS) {
@@ -153,6 +154,7 @@ static void capture_and_decode_qr(void)
     }
     ESP_LOGI(TAG, "Done processing QR code");
     esp_camera_fb_return(fb);
+    vTaskDelay(pdMS_TO_TICKS(100));
     quirc_destroy(qr);
 }
 
