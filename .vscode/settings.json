@@ -5,7 +5,7 @@
   "idf.openOcdConfigs": [
     "board/esp32-wrover-kit-3.3v.cfg"
   ],
-  "idf.portWin": "COM10",
+  "idf.portWin": "COM9",
   "idf.toolsPathWin": "c:\\Users\\Houss\\.espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
@@ -15,5 +15,6 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=d:\\ESP-IDF projects\\ESP-CAM-QR-DECODE\\ESP-CAM-QR-DECODE\\build"
-  ]
+  ],
+  "idf.flashType": "UART"
 }
